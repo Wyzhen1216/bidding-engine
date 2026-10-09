@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>电商平台广告位分时段动态竞价引擎 - 可视化</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: 'Microsoft YaHei', 'PingFang SC', sans-serif; 
+            background: #1a1a2e; color: #eee; padding: 20px; 
+        }
+        h1 { text-align: center; margin-bottom: 8px; color: #e94560; font-size: 24px; }
+        .subtitle { text-align: center; color: #888; font-size: 13px; margin-bottom: 20px; }
+        .slot-container { margin: 12px 0; background: #16213e; border-radius: 8px; padding: 12px 15px; }
+        .slot-title { color: #4ECDC4; font-size: 15px; margin-bottom: 6px; font-weight: bold; }
+        canvas { border: 1px solid #0f3460; border-radius: 4px; cursor: crosshair; display: block; }
+        .info-panel { margin-top: 12px; background: #0f3460; border-radius: 8px; padding: 12px 15px; }
+        .info-title { color: #FFEAA7; font-size: 15px; margin-bottom: 6px; font-weight: bold; }
+        #pointInfo { color: #96CEB4; font-size: 14px; min-height: 20px; }
+        #traceLog { 
+            color: #85C1E9; font-size: 12px; font-family: Consolas, 'Courier New', monospace; 
+            max-height: 200px; overflow-y: auto; white-space: pre-wrap; line-height: 1.5; 
+        }
+        .legend { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+        .legend-item { display: flex; align-items: center; gap: 3px; font-size: 11px; }
+        .legend-color { width: 14px; height: 14px; border-radius: 3px; }
+        .controls { margin-bottom: 15px; text-align: center; }
+        .controls button {
+            background: #e94560; color: #fff; border: none; padding: 8px 16px;
+            border-radius: 5px; cursor: pointer; font-size: 13px; margin: 0 5px;
+        }
+        .controls button:hover { background: #c73e54; }
+        .controls select, .controls input {
+            background: #16213e; color: #eee; border: 1px solid #0f3460;
+            padding: 6px 10px; border-radius: 4px; font-size: 13px; margin: 0 3px;
+        }
+        .stats { color: #BB8FCE; font-size: 13px; line-height: 1.6; }
+        .highlight-bar { 
+            position: absolute; width: 2px; background: #FFD700; pointer-events: none; 
+        }
+    </style>
+</head>
+<body>
+    <h1>电商平台广告位分时段动态竞价引擎</h1>
+    <div class="subtitle">Segment Tree 动态竞价可视化面板 | 时间粒度: 1分钟 | 全天: 1440分钟</div>
+
+    <div class="controls">
+        <label>广告位:</label>
+        <select id="slotSelect">
+            <option value="0">广告位1 - 首页Banner</option>
+            <option value="1">广告位2 - 侧边栏</option>
+            <option value="2">广告位3 - 搜索栏上方</option>
+            <option value="3">广告位4 - 底部横幅</option>
+        </select>
+        <label>查询时间(分钟):</label>
+        <input type="number" id="timeInput" min="0" max="1439" value="840" style="width:80px;">
+        <button onclick="doPointQuery()">单点查询</button>
+        <button onclick="doRangeQuery()">区间最高价</button>
+        <label>区间结束:</label>
+        <input type="number" id="timeEndInput" min="0" max="1439" value="900" style="width:80px;">
+    </div>
+
+    <div id="slots"></div>
+
+    <div class="info-panel">
+        <div class="info-title">单点查询详情</div>
+        <div id="pointInfo">点击时间轴上的任意位置查看竞价详情</div>
+    </div>
+    <div class="info-panel">
+        <div class="info-title">线段树路径溯源</div>
+        <div id="traceLog">执行查询或更新操作时，此处显示线段树遍历路径</div>
+    </div>
+    <div class="info-panel">
+        <div class="info-title">操作日志</div>
+        <div id="opLog" style="color:#82E0AA; font-size:12px; font-family:Consolas,monospace; max-height:150px; overflow-y:auto; white-space:pre-wrap; line-height:1.5;"></div>
+    </div>
+    <div class="info-panel">
+        <div class="info-title">系统统计</div>
+        <div class="stats" id="statsInfo">加载中...</div>
+    </div>
+
+<script>
+// ====== 竞价引擎核心实现 (JavaScript版,与C++逻辑一致) ======
+
+const MAXN = 1440;
+const NUM_SLOTS = 4;
+const SLOT_NAMES = ['首页Banner', '侧边栏', '搜索栏上方', '底部横幅'];
+
+// 竞价者颜色
+const BIDDER_COLORS = [
+    "#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFEAA7",
+    "#DDA0DD", "#98D8C8", "#F7DC6F", "#BB8FCE", "#85C1E9",
+    "#F1948A", "#82E0AA", "#F8C471", "#AED6F1", "#D7BDE2"
+];
+const BIDDER_NAMES = [];
+for (let i = 0; i < 15; i++) BIDDER_NAMES.push('Adv_' + String.fromCharCode(65 + i));
+const bidderColorMap = {};
+BIDDER_NAMES.forEach((name, i) => bidderColorMap[name] = BIDDER_COLORS[i]);
+
+// 线段树节点
+class STNode {
+    constructor() {
+        this.start = 0;
+        this.end = 0;
+        this.bids = [];       // {bidId, bidderId, price, active}
+        this.directMaxBid = 0;
+        this.directMaxBidders = [];
+        this.overallMaxBid = 0;
+        this.overallMaxBidder = '';
+        this.lazyMarked = false;
+    }
+}
+
+// 线段树
+class SegmentTree {
+    constructor() {
+        this.tree = new Array(4 * MAXN + 10);
+        for (let i = 0; i < this.tree.length; i++) this.tree[i] = new STNode();
+        this.traceLog = [];
+        this.enableTrace = false;
+        this.build(1, 0, MAXN - 1);
+    }
+
+    build(idx, l, r) {
+        this.tree[idx].start = l;
+        this.tree[idx].end = r;
+        if (l === r) return;
+        let mid = Math.floor((l + r) / 2);
+        this.build(idx * 2, l, mid);
+        this.build(idx * 2 + 1, mid + 1, r);
+    }
+
+    considerDirectMax(idx) {
+        let node = this.tree[idx];
+        if (node.directMaxBid > this._rangeMax) {
+            this._rangeMax = node.directMaxBid;
+            this._rangeWinner = node.directMaxBidders.length > 0 ? node.directMaxBidders[0] : '';
+        }
+    }
+
+    recalcDirect(idx) {
+        let node = this.tree[idx];
+        node.directMaxBid = 0;
+        node.directMaxBidders = [];
+        node.lazyMarked = false;
+        for (let entry of node.bids) {
+            if (!entry.active) continue;
+            node.lazyMarked = true;
+            if (entry.price > node.directMaxBid) {
+                node.directMaxBid = entry.price;
+                node.directMaxBidders = [entry.bidderId];
+            } else if (entry.price === node.directMaxBid) {
+                if (!node.directMaxBidders.includes(entry.bidderId)) {
+                    node.directMaxBidders.push(entry.bidderId);
+                }
+            }
+        }
+    }
+
+    pushUp(idx) {
+        let node = this.tree[idx];
+        let leftMax = this.tree[idx * 2] ? this.tree[idx * 2].overallMaxBid : 0;
+        let rightMax = this.tree[idx * 2 + 1] ? this.tree[idx * 2 + 1].overallMaxBid : 0;
+        let childMax = Math.max(leftMax, rightMax);
+        node.overallMaxBid = Math.max(node.directMaxBid, childMax);
+
+        if (node.directMaxBid >= childMax && node.directMaxBid > 0) {
+            node.overallMaxBidder = node.directMaxBidders.length > 0 ? node.directMaxBidders[0] : '';
+        } else if (leftMax >= rightMax && leftMax > 0) {
+            node.overallMaxBidder = this.tree[idx * 2].overallMaxBidder;
+        } else if (rightMax > 0) {
+            node.overallMaxBidder = this.tree[idx * 2 + 1].overallMaxBidder;
+        } else {
+            node.overallMaxBidder = '';
+        }
+    }
+
+    pushUpToRoot(idx) {
+        while (idx >= 1) {
+            this.pushUp(idx);
+            idx = Math.floor(idx / 2);
+        }
+    }
+
+    rangeUpdate(ql, qr, bidId, bidder, price) {
+        let affectedNodes = [];
+        this.traceLog = [];
+        if (this.enableTrace) this.traceLog.push(`[Update] 区间[${ql}-${qr}] 竞价者:${bidder} 出价:${price}`);
+        this._rangeUpdateImpl(1, ql, qr, bidId, bidder, price, affectedNodes);
+        for (let nIdx of affectedNodes) this.pushUpToRoot(nIdx);
+        return affectedNodes;
+    }
+
+    _rangeUpdateImpl(idx, ql, qr, bidId, bidder, price, affectedNodes) {
+        let node = this.tree[idx];
+        if (this.enableTrace) this.traceLog.push(`访问节点 [${node.start}-${node.end}]`);
+        if (ql > node.end || qr < node.start) return;
+        if (ql <= node.start && node.end <= qr) {
+            node.bids.push({bidId, bidderId: bidder, price, active: true});
+            node.lazyMarked = true;
+            if (price > node.directMaxBid) {
+                node.directMaxBid = price;
+                node.directMaxBidders = [bidder];
+            } else if (price === node.directMaxBid) {
+                if (!node.directMaxBidders.includes(bidder)) node.directMaxBidders.push(bidder);
+            }
+            node.overallMaxBid = Math.max(node.overallMaxBid, price);
+            if (price >= node.overallMaxBid) node.overallMaxBidder = bidder;
+            affectedNodes.push(idx);
+            if (this.enableTrace) this.traceLog.push(`命中区间 [${node.start}-${node.end}] 竞价者:${bidder} 出价:${price}`);
+            return;
+        }
+        this._rangeUpdateImpl(idx * 2, ql, qr, bidId, bidder, price, affectedNodes);
+        this._rangeUpdateImpl(idx * 2 + 1, ql, qr, bidId, bidder, price, affectedNodes);
+        this.pushUp(idx);
+    }
+
+    _pointQueryImpl(idx, t) {
+        let node = this.tree[idx];
+        if (this.enableTrace) this.traceLog.push(`访问节点 [${node.start}-${node.end}]`);
+        
+        if (node.directMaxBid > this._maxPrice) {
+            this._maxPrice = node.directMaxBid;
+            this._winnerList = [...node.directMaxBidders];
+        } else if (node.directMaxBid === this._maxPrice && node.directMaxBid > 0) {
+            for (let w of node.directMaxBidders) {
+                if (!this._winnerList.includes(w)) this._winnerList.push(w);
+            }
+        }
+
+        if (node.start === node.end) {
+            if (this.enableTrace) this.traceLog.push(`命中叶子 [${node.start}] 最高价:${this._maxPrice}`);
+            return;
+        }
+        let mid = Math.floor((node.start + node.end) / 2);
+        if (t <= mid) this._pointQueryImpl(idx * 2, t);
+        else this._pointQueryImpl(idx * 2 + 1, t);
+    }
+
+    pointQuery(t) {
+        this._maxPrice = 0;
+        this._winnerList = [];
+        this.traceLog = [];
+        if (this.enableTrace) this.traceLog.push(`[Query] 单点查询 时间=${t}`);
+        this._pointQueryImpl(1, t);
+        return {maxPrice: this._maxPrice, winners: this._winnerList};
+    }
+
+    rangeQuery(ql, qr) {
+        this._rangeMax = 0;
+        this._rangeWinner = '';
+        this.traceLog = [];
+        if (this.enableTrace) this.traceLog.push(`[Query] 区间查询 [${ql}-${qr}]`);
+        this._rangeQueryImpl(1, ql, qr);
+        return {maxPrice: this._rangeMax, winner: this._rangeWinner};
+    }
+
+    _rangeQueryImpl(idx, ql, qr) {
+        let node = this.tree[idx];
+        if (ql > node.end || qr < node.start) return;
+        if (this.enableTrace) this.traceLog.push(`访问节点 [${node.start}-${node.end}] overallMax=${node.overallMaxBid}`);
+        if (ql <= node.start && node.end <= qr) {
+            if (node.overallMaxBid > this._rangeMax) {
+                this._rangeMax = node.overallMaxBid;
+                this._rangeWinner = node.overallMaxBidder;
+            }
+            return;
+        }
+        this.considerDirectMax(idx);
+        this._rangeQueryImpl(idx * 2, ql, qr);
+        this._rangeQueryImpl(idx * 2 + 1, ql, qr);
+    }
+
+    withdrawAtNodes(bidId, nodeIndices) {
+        for (let idx of nodeIndices) {
+            for (let entry of this.tree[idx].bids) {
+                if (entry.bidId === bidId) entry.active = false;
+            }
+            this.recalcDirect(idx);
+            this.pushUpToRoot(idx);
+        }
+    }
+
+    getAllLeafStates() {
+        let states = new Array(MAXN);
+        for (let t = 0; t < MAXN; t++) {
+            let result = this.pointQuery(t);
+            states[t] = result;
+        }
+        return states;
+    }
+}
+
+// 竞价引擎
+class BiddingEngine {
+    constructor(numSlots) {
+        this.numSlots = numSlots || 4;
+        this.slots = [];
+        for (let i = 0; i < this.numSlots; i++) this.slots.push(new SegmentTree());
+        this.bidRecords = {};
+        this.nextBidId = 1;
+    }
+
+    placeBid(slotId, start, end, bidder, price) {
+        if (slotId < 0 || slotId >= this.numSlots || start < 0 || end >= MAXN || start > end || price <= 0) return -1;
+        let bidId = this.nextBidId++;
+        let affectedNodes = this.slots[slotId].rangeUpdate(start, end, bidId, bidder, price);
+        this.bidRecords[bidId] = {bidId, bidderId: bidder, price, start, end, slotId, nodeIndices: affectedNodes, active: true};
+        return bidId;
+    }
+
+    queryPoint(slotId, t) {
+        if (slotId < 0 || slotId >= this.numSlots || t < 0 || t >= MAXN) return {maxPrice: 0, winners: []};
+        return this.slots[slotId].pointQuery(t);
+    }
+
+    queryRange(slotId, start, end) {
+        if (slotId < 0 || slotId >= this.numSlots || start < 0 || end >= MAXN || start > end) return {maxPrice: 0, winner: ''};
+        return this.slots[slotId].rangeQuery(start, end);
+    }
+
+    withdrawBid(bidId) {
+        let record = this.bidRecords[bidId];
+        if (!record || !record.active) return false;
+        record.active = false;
+        this.slots[record.slotId].withdrawAtNodes(bidId, record.nodeIndices);
+        return true;
+    }
+
+    getTraceLog(slotId) {
+        return this.slots[slotId].traceLog;
+    }
+}
+
+// ====== 数据生成 ======
+function generateData(engine, count) {
+    let rng = (function(seed) {
+        return function() {
+            seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+            return seed;
+        };
+    })(42);
+
+    let bidIds = [];
+    let forWithdraw = [];
+
+    // 阶段1: 时间重叠 (40%)
+    let overlapCount = Math.floor(count * 0.4);
+    for (let i = 0; i < overlapCount; i++) {
+        let slotId = rng() % engine.numSlots;
+        let start = 480 + rng() % 840;
+        let duration = 10 + rng() % 120;
+        let end = Math.min(start + duration, 1439);
+        let bidder = BIDDER_NAMES[rng() % 15];
+        let price = 100 + rng() % 900;
+        let bidId = engine.placeBid(slotId, start, end, bidder, price);
+        if (bidId > 0) {
+            bidIds.push(bidId);
+            if (rng() % 5 === 0) forWithdraw.push(bidId);
+        }
+    }
+
+    // 阶段2: 价格竞争 (30%)
+    let competeCount = Math.floor(count * 0.3);
+    for (let i = 0; i < competeCount; i++) {
+        let slotId = rng() % engine.numSlots;
+        let start = 480 + rng() % 840;
+        let duration = 5 + rng() % 60;
+        let end = Math.min(start + duration, 1439);
+        let bidder = BIDDER_NAMES[rng() % 15];
+        let basePrice = 100 + (i % 20) * 50;
+        let price = basePrice + rng() % 200;
+        let bidId = engine.placeBid(slotId, start, end, bidder, price);
+        if (bidId > 0) {
+            bidIds.push(bidId);
+            if (rng() % 5 === 0) forWithdraw.push(bidId);
+        }
+    }
+
+    // 阶段3: 撤价场景 (20%)
+    let withdrawCount = Math.floor(count * 0.2);
+    for (let i = 0; i < withdrawCount; i++) {
+        let slotId = rng() % engine.numSlots;
+        let start = rng() % 1440;
+        let duration = 1 + rng() % 180;
+        let end = Math.min(start + duration, 1439);
+        let bidder = BIDDER_NAMES[rng() % 15];
+        let price = 100 + rng() % 900;
+        let bidId = engine.placeBid(slotId, start, end, bidder, price);
+        if (bidId > 0) {
+            bidIds.push(bidId);
+            if (rng() % 3 === 0) forWithdraw.push(bidId);
+        }
+    }
+
+    // 阶段4: 并发竞价 (10%)
+    let concurrentCount = Math.floor(count * 0.1);
+    for (let i = 0; i < concurrentCount; i++) {
+        let slotId = rng() % engine.numSlots;
+        let start = rng() % 1440;
+        let duration = 1 + rng() % 180;
+        let end = Math.min(start + duration, 1439);
+        let samePrice = 200 + rng() % 300;
+        let numBidders = 2 + rng() % 3;
+        for (let j = 0; j < numBidders; j++) {
+            let bidder = BIDDER_NAMES[rng() % 15];
+            let price = samePrice + (rng() % 2 === 0 ? 0 : rng() % 50);
+            let bidId = engine.placeBid(slotId, start, end, bidder, price);
+            if (bidId > 0) bidIds.push(bidId);
+        }
+    }
+
+    // 执行部分撤价
+    let withdrawExecCount = Math.min(forWithdraw.length, Math.floor(count / 10));
+    for (let i = 0; i < withdrawExecCount; i++) {
+        let idx = rng() % forWithdraw.length;
+        engine.withdrawBid(forWithdraw[idx]);
+    }
+
+    return bidIds;
+}
+
+// ====== 初始化引擎 ======
+const engine = new BiddingEngine(NUM_SLOTS);
+console.log('生成5000条竞价数据...');
+const bidIds = generateData(engine, 5000);
+console.log('数据生成完毕, 共' + bidIds.length + '条');
+
+// 开启路径溯源
+for (let s = 0; s < NUM_SLOTS; s++) engine.slots[s].enableTrace = true;
+
+// ====== 渲染可视化 ======
+const container = document.getElementById('slots');
+const canvases = [];
+const canvasData = [];  // 缓存每个广告位的时间线数据
+
+// 预计算时间线数据
+function computeTimeline(slotId) {
+    let data = new Array(MAXN);
+    // 逐点查询(仅获取结果,不记录trace)
+    engine.slots[slotId].enableTrace = false;
+    for (let t = 0; t < MAXN; t++) {
+        data[t] = engine.slots[slotId].pointQuery(t);
+    }
+    engine.slots[slotId].enableTrace = true;
+    return data;
+}
+
+for (let s = 0; s < NUM_SLOTS; s++) {
+    canvasData.push(computeTimeline(s));
+}
+
+function timeToStr(minutes) {
+    let h = Math.floor(minutes / 60);
+    let m = minutes % 60;
+    return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+}
+
+function drawTimeline(slotId, highlightTime) {
+    let canvas = canvases[slotId];
+    let ctx = canvas.getContext('2d');
+    let data = canvasData[slotId];
+    let width = canvas.width;
+    let height = canvas.height;
+
+    ctx.fillStyle = '#0a0a23';
+    ctx.fillRect(0, 0, width, height);
+
+    // 绘制每个分钟段
+    for (let t = 0; t < MAXN; t++) {
+        let x = t / MAXN * width;
+        let w = Math.max(width / MAXN, 0.9);
+        if (data[t].maxPrice > 0 && data[t].winners && data[t].winners.length > 0) {
+            ctx.fillStyle = bidderColorMap[data[t].winners[0]] || '#666';
+            let h = Math.min(data[t].maxPrice / 1500 * (height - 15), height - 6);
+            ctx.fillRect(x, height - h - 3, w, h);
+        }
+    }
+
+    // 时间刻度
+    ctx.fillStyle = '#666';
+    ctx.font = '9px sans-serif';
+    for (let h = 0; h < 24; h += 3) {
+        let x = h * 60 / MAXN * width;
+        ctx.fillText(h + ':00', x + 2, height - 2);
+        ctx.strokeStyle = '#2a2a4a';
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height - 12);
+        ctx.stroke();
+    }
+
+    // 高亮线
+    if (highlightTime !== undefined && highlightTime >= 0 && highlightTime < MAXN) {
+        let x = highlightTime / MAXN * width;
+        ctx.strokeStyle = '#FFD700';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height);
+        ctx.stroke();
+        ctx.lineWidth = 1;
+    }
+}
+
+function renderLegend(slotId) {
+    let data = canvasData[slotId];
+    let legendDiv = document.getElementById('legend_' + slotId);
+    legendDiv.innerHTML = '';
+    let seen = new Set();
+    for (let t = 0; t < MAXN; t++) {
+        if (data[t].winners && data[t].winners.length > 0) {
+            let w = data[t].winners[0];
+            if (!seen.has(w)) {
+                seen.add(w);
+                let item = document.createElement('div');
+                item.className = 'legend-item';
+                let box = document.createElement('div');
+                box.className = 'legend-color';
+                box.style.background = bidderColorMap[w] || '#666';
+                item.appendChild(box);
+                item.appendChild(document.createTextNode(w));
+                legendDiv.appendChild(item);
+            }
+        }
+    }
+}
+
+// 创建Canvas
+for (let s = 0; s < NUM_SLOTS; s++) {
+    let div = document.createElement('div');
+    div.className = 'slot-container';
+
+    let title = document.createElement('div');
+    title.className = 'slot-title';
+    title.textContent = '广告位' + (s + 1) + ': ' + SLOT_NAMES[s] + ' (Slot ' + s + ')';
+    div.appendChild(title);
+
+    let canvas = document.createElement('canvas');
+    canvas.width = 1200;
+    canvas.height = 55;
+    canvas.id = 'canvas_' + s;
+    div.appendChild(canvas);
+
+    let legend = document.createElement('div');
+    legend.className = 'legend';
+    legend.id = 'legend_' + s;
+    div.appendChild(legend);
+
+    container.appendChild(div);
+    canvases.push(canvas);
+
+    drawTimeline(s);
+    renderLegend(s);
+
+    // 点击交互
+    canvas.addEventListener('click', function(e) {
+        let rect = canvas.getBoundingClientRect();
+        let x = e.clientX - rect.left;
+        let time = Math.floor(x / canvas.width * MAXN);
+        if (time >= 0 && time < MAXN) {
+            showPointInfo(s, time);
+        }
+    });
+
+    // 鼠标移动高亮
+    canvas.addEventListener('mousemove', function(e) {
+        let rect = canvas.getBoundingClientRect();
+        let x = e.clientX - rect.left;
+        let time = Math.floor(x / canvas.width * MAXN);
+        if (time >= 0 && time < MAXN) {
+            // 重绘所有
+            for (let i = 0; i < NUM_SLOTS; i++) drawTimeline(i, undefined);
+            drawTimeline(s, time);
+        }
+    });
+}
+
+function showPointInfo(slotId, time) {
+    let data = canvasData[slotId][time];
+    let timeStr = timeToStr(time);
+
+    let info = '广告位' + (slotId + 1) + ' (' + SLOT_NAMES[slotId] + ') | 时间: ' + timeStr + ' (分钟' + time + ')';
+    if (data.maxPrice > 0 && data.winners && data.winners.length > 0) {
+        info += ' | 胜出者: ' + data.winners.join(', ') + ' | 出价: ¥' + data.maxPrice;
+    } else {
+        info += ' | 无竞价';
+    }
+    document.getElementById('pointInfo').textContent = info;
+
+    // 高亮
+    for (let i = 0; i < NUM_SLOTS; i++) drawTimeline(i, undefined);
+    drawTimeline(slotId, time);
+
+    // 路径溯源
+    let result = engine.slots[slotId].pointQuery(time);
+    let trace = engine.getTraceLog(slotId);
+    if (trace && trace.length > 0) {
+        document.getElementById('traceLog').textContent = trace.join('\n');
+    }
+
+    // 操作日志
+    addOpLog('[Query] 广告位' + (slotId+1) + ' 时间=' + time + '(' + timeStr + ') → ' + 
+             (data.maxPrice > 0 ? '胜出:' + data.winners.join(',') + ' 出价:¥' + data.maxPrice : '无竞价'));
+}
+
+function doPointQuery() {
+    let slotId = parseInt(document.getElementById('slotSelect').value);
+    let time = parseInt(document.getElementById('timeInput').value);
+    if (isNaN(time) || time < 0 || time >= MAXN) {
+        document.getElementById('pointInfo').textContent = '时间无效,范围0-1439';
+        return;
+    }
+    showPointInfo(slotId, time);
+}
+
+function doRangeQuery() {
+    let slotId = parseInt(document.getElementById('slotSelect').value);
+    let start = parseInt(document.getElementById('timeInput').value);
+    let end = parseInt(document.getElementById('timeEndInput').value);
+    if (isNaN(start) || isNaN(end) || start < 0 || end >= MAXN || start > end) {
+        document.getElementById('pointInfo').textContent = '区间无效';
+        return;
+    }
+
+    let result = engine.queryRange(slotId, start, end);
+    let trace = engine.getTraceLog(slotId);
+    let info = '广告位' + (slotId + 1) + ' 区间[' + start + '-' + end + '] (' + timeToStr(start) + '-' + timeToStr(end) + ')';
+    if (result.maxPrice > 0) {
+        info += ' → 最高价: ¥' + result.maxPrice + ' 胜出: ' + result.winner;
+    } else {
+        info += ' → 无竞价';
+    }
+    document.getElementById('pointInfo').textContent = info;
+
+    if (trace && trace.length > 0) {
+        document.getElementById('traceLog').textContent = trace.join('\n');
+    }
+
+    addOpLog('[RangeQuery] ' + info);
+}
+
+function addOpLog(msg) {
+    let logDiv = document.getElementById('opLog');
+    let time = new Date().toLocaleTimeString();
+    logDiv.textContent += '[' + time + '] ' + msg + '\n';
+    logDiv.scrollTop = logDiv.scrollHeight;
+}
+
+// 统计信息
+let activeBids = 0, totalBids = 0;
+for (let id in engine.bidRecords) {
+    totalBids++;
+    if (engine.bidRecords[id].active) activeBids++;
+}
+
+let coveragePct = [];
+for (let s = 0; s < NUM_SLOTS; s++) {
+    let covered = 0;
+    for (let t = 0; t < MAXN; t++) {
+        if (canvasData[s][t].maxPrice > 0) covered++;
+    }
+    coveragePct.push((covered / MAXN * 100).toFixed(1));
+}
+
+let statsHtml = '总竞价数: ' + totalBids + ' | 活跃竞价: ' + activeBids + 
+                ' | 已撤竞价: ' + (totalBids - activeBids) + '<br>';
+statsHtml += '竞价者数量: 15 | 广告位数量: ' + NUM_SLOTS + '<br>';
+for (let s = 0; s < NUM_SLOTS; s++) {
+    statsHtml += '广告位' + (s+1) + ' 时间覆盖率: ' + coveragePct[s] + '%<br>';
+}
+document.getElementById('statsInfo').innerHTML = statsHtml;
+
+addOpLog('系统初始化完成, 已加载' + totalBids + '条竞价数据');
+</script>
+</body>
+</html>

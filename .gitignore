@@ -1,0 +1,25 @@
+# 构建产物
+build/
+out/
+*.exe
+*.o
+*.obj
+*.out
+*.pdb
+*.ilk
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 大文件与含个人信息的材料：不要提交到公开仓库
+*.mp4
+*.mov
+*.zip
+*.rar
+*.doc
+*.docx
+*.pdf
+
